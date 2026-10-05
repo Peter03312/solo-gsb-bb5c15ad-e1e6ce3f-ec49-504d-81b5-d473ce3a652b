@@ -161,6 +161,21 @@ export const createBerthBookingSchema = z
   .transform((d) => ({ ...d }));
 
 /**
+ * 靠泊预订改期（调整已生效预订）：
+ *  - bookingId：原预订 ID（路径参数；仅仍有效的预订可改期）；
+ *  - berth/startAt/endAt：新泊位与带时区的新窗口（必须含时区、起点早于终点由业务层校验，
+ *    给出 invalid_time_window 的明确错误）；
+ *  - adjustmentNo：同一原预订内唯一的调整号（同号同内容重试幂等，改内容报冲突）。
+ * 审查、卸港与冻结的清单修订号/实际卸箱数由新记录继承，不在请求体内。
+ */
+export const rescheduleBerthBookingSchema = z.object({
+  berth: z.string().trim().min(1, '泊位不能为空').max(64),
+  startAt: z.string().trim().min(1, '起始时刻不能为空'),
+  endAt: z.string().trim().min(1, '结束时刻不能为空'),
+  adjustmentNo: z.string().trim().min(1, '调整号不能为空').max(64),
+});
+
+/**
  * 对已签发冻结清单提交卸货审查：
  *  - ports：有序卸港列表（业务层再查空/重复；空数组直接非法）；
  *  - items：清单内每个箱的卸港（箱号集合必须与清单完全一致，业务层校验）。

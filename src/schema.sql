@@ -312,3 +312,28 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_berth_bookings_review ON berth_bookings (review_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_berth_bookings_voyage ON berth_bookings (voyage_id, created_at);
+
+-- ---- 靠泊预订改期（reschedule）----
+-- 港口调度员可调整已生效的预订：提交原预订 ID、新泊位、带时区起止时刻与调整号。
+-- 受理后在同一事务内：旧记录置 cancelled 并以 superseded_by 关联新记录（释放旧窗口），
+-- 插入新记录（占用新窗口）——新记录继承原审查、卸港及冻结的清单修订号与实际卸箱数，
+-- 并记录调整号 adjustment_no 与来源预订 rescheduled_from；任一校验失败整体回滚，原预订不变。
+--  - 改期产生的新记录 submission_no 为 NULL（提交号幂等键只属于原始预订；原提交号重试
+--    仍命中旧记录并返回其当前状态），故 submission_no 放宽为可空
+--    （(review_id, submission_no) 唯一约束对 NULL 不生效，行为兼容）；
+--  - (rescheduled_from, adjustment_no) 部分唯一：同一原预订同一调整号至多一条调整结果，
+--    支撑“同号同内容重试返回新记录当前状态、同号改内容报冲突”；
+--  - 新窗口沿用既有部分约束：同审查同港至多一个有效预订、同港同泊位半开区间不重叠
+--    （旧记录先在同事务内置取消，故新窗口允许与原窗口自身重叠/相接）。
+ALTER TABLE berth_bookings ADD COLUMN IF NOT EXISTS adjustment_no TEXT;
+ALTER TABLE berth_bookings ADD COLUMN IF NOT EXISTS rescheduled_from UUID;
+ALTER TABLE berth_bookings ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE berth_bookings ALTER COLUMN submission_no DROP NOT NULL;
+
+DO $$
+BEGIN
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_berth_booking_adjustment
+        ON berth_bookings (rescheduled_from, adjustment_no)
+        WHERE rescheduled_from IS NOT NULL;
+EXCEPTION WHEN duplicate_table THEN NULL;
+END $$;

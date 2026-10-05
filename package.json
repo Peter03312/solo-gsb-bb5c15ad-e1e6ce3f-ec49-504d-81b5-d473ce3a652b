@@ -16,6 +16,7 @@
     "e2e:migrate": "node test/e2e-migrate.js",
     "e2e:discharge": "node test/e2e-discharge.js",
     "e2e:berth": "node test/e2e-berth.js",
+    "e2e:reschedule": "node test/e2e-reschedule.js",
     "demo": "tsx examples/demo.ts"
   },
   "dependencies": {

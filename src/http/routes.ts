@@ -16,6 +16,7 @@ import {
   issueManifestSchema,
   migratePlanSchema,
   openCheckJobSchema,
+  rescheduleBerthBookingSchema,
   updateConstraintsSchema,
 } from './schemas';
 
@@ -201,6 +202,24 @@ export function createApiRouter(
     berthBookingService
       .cancelBooking(bookingId)
       .then((v) => res.status(v.replay ? 200 : 200).json(v))
+      .catch(next);
+  });
+
+  // 改期已生效的预订：原子释放旧窗口并占用新窗口（新记录继承审查/卸港/冻结快照）；
+  // 调整号同号同内容重试 200 replay 返回新记录当前状态，改内容 409；失败不改变原预订
+  router.post('/berth-bookings/:bookingId/reschedule', (req, res, next) => {
+    const bookingId = parseBookingId(req);
+    const input = parseBody(rescheduleBerthBookingSchema, req.body);
+    berthBookingService
+      .rescheduleBooking({ ...input, bookingId })
+      .then((v) =>
+        res.status(v.replay ? 200 : 201).json({
+          rescheduled: true,
+          replay: v.replay,
+          booking: v.booking,
+          superseded: v.superseded,
+        }),
+      )
       .catch(next);
   });
 

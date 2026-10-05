@@ -263,3 +263,39 @@ GET {{host}}/api/berth-bookings/{{bookingId}}
 
 ### 取消预订（保留记录、释放占用；重复取消 replay:true）
 POST {{host}}/api/berth-bookings/{{bookingId}}/cancel
+
+### ========== 靠泊预订改期（调整已生效预订）==========
+
+### 改期：新泊位 + 带时区新窗口 + 调整号（原子释放旧窗口并占用新窗口；首次 201）
+### 新记录继承原审查、卸港及冻结的清单修订号与实际卸箱数；旧记录保留为已取消并关联新记录
+POST {{host}}/api/berth-bookings/{{bookingId}}/reschedule
+Content-Type: application/json
+
+{
+  "berth": "B-8",
+  "startAt": "2026-10-12T08:00:00+08:00",
+  "endAt": "2026-10-12T12:00:00+08:00",
+  "adjustmentNo": "ADJ-001"
+}
+
+### 同调整号同内容重试（等效时区，同一绝对时刻）-> 200 replay:true，返回新记录当前状态
+POST {{host}}/api/berth-bookings/{{bookingId}}/reschedule
+Content-Type: application/json
+
+{
+  "berth": "B-8",
+  "startAt": "2026-10-12T00:00:00Z",
+  "endAt": "2026-10-12T04:00:00Z",
+  "adjustmentNo": "ADJ-001"
+}
+
+### 同调整号改内容 -> 409 booking_adjustment_conflict
+POST {{host}}/api/berth-bookings/{{bookingId}}/reschedule
+Content-Type: application/json
+
+{
+  "berth": "B-9",
+  "startAt": "2026-10-12T08:00:00+08:00",
+  "endAt": "2026-10-12T12:00:00+08:00",
+  "adjustmentNo": "ADJ-001"
+}
