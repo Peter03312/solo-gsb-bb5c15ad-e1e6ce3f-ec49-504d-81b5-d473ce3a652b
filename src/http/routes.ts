@@ -7,6 +7,7 @@ import { DischargeService } from '../discharge-service';
 import { BerthBookingService } from '../berth-service';
 import { HttpError } from '../errors';
 import {
+  adjustBerthBookingSchema,
   applyMovesSchema,
   checkReportSchema,
   createBerthBookingSchema,
@@ -201,6 +202,24 @@ export function createApiRouter(
     berthBookingService
       .cancelBooking(bookingId)
       .then((v) => res.status(v.replay ? 200 : 200).json(v))
+      .catch(next);
+  });
+
+  // 调整（改期）已生效的预订：原子释放旧窗口并占用新窗口，旧记录保留为已取消并关联新记录；
+  // 同调整号同内容重试 200 replay 返回新记录当前状态，同号改内容 409
+  router.post('/berth-bookings/:bookingId/adjust', (req, res, next) => {
+    const bookingId = parseBookingId(req);
+    const input = parseBody(adjustBerthBookingSchema, req.body);
+    berthBookingService
+      .adjustBooking(bookingId, input)
+      .then((v) =>
+        res.status(v.replay ? 200 : 201).json({
+          adjusted: true,
+          replay: v.replay,
+          booking: v.booking,
+          previousBooking: v.previousBooking,
+        }),
+      )
       .catch(next);
   });
 

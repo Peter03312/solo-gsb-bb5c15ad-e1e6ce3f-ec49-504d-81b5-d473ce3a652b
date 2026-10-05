@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   evaluatePort,
   parseTimeWindow,
+  sameAdjustmentContent,
   sameBookingContent,
 } from '../src/berthing';
 import { DischargeSimulation } from '../src/discharge';
@@ -147,4 +148,29 @@ test('改泊位/改时刻/改港任一不同即冲突', () => {
   assert.equal(sameBookingContent(base, { ...base, berth: 'B-2' }), false);
   assert.equal(sameBookingContent(base, { ...base, endMs: 2000 }), false);
   assert.equal(sameBookingContent(base, { ...base, dischargePort: 'SHA' }), false);
+});
+
+/* ---------- sameAdjustmentContent ---------- */
+
+test('改期同内容（不同时区写法、同一绝对时刻）判为一致', () => {
+  assert.equal(
+    sameAdjustmentContent(
+      { berth: 'B-1', startMs: Date.parse('2026-10-05T08:00:00Z'), endMs: Date.parse('2026-10-05T09:00:00Z') },
+      { berth: 'B-1', startMs: Date.parse('2026-10-05T16:00:00+08:00'), endMs: Date.parse('2026-10-05T17:00:00+08:00') },
+    ),
+    true,
+  );
+});
+
+test('改期改泊位/改起止任一不同即冲突', () => {
+  const base = { berth: 'B-1', startMs: 0, endMs: 1000 };
+  assert.equal(sameAdjustmentContent(base, { ...base, berth: 'B-2' }), false);
+  assert.equal(sameAdjustmentContent(base, { ...base, startMs: 500 }), false);
+  assert.equal(sameAdjustmentContent(base, { ...base, endMs: 2000 }), false);
+});
+
+test('改期内容不含港/审查：只比较泊位与起止绝对时刻', () => {
+  // 非法时刻解析为 NaN 时与任何已存内容都不一致（NaN !== NaN）
+  const stored = { berth: 'B-1', startMs: 1000, endMs: 2000 };
+  assert.equal(sameAdjustmentContent(stored, { berth: 'B-1', startMs: NaN, endMs: 2000 }), false);
 });

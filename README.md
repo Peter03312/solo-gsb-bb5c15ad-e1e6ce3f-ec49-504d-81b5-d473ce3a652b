@@ -16,6 +16,8 @@ TypeScript / Node.js + PostgreSQL 实现的危险货箱三维舱位配载审定�
 
 卸货审查留档后，港口调度员可据其**预订靠泊窗口（berth booking）**：提交审查 ID、审查内某一卸港、泊位、带时区的起止时刻与提交号。**仅当该港在审查模拟中确有实际卸箱且无受阻箱时受理**；受理即冻结**清单修订号**与**该港实际卸箱数**，审查/清单后续调整或签发新清单**不回写**预订。起点必须严格早于终点；**同港同泊位的有效窗口即使来自不同航次也不得重叠（半开区间，首尾相接可用），并发竞争只有一方成功**；同一审查同一卸港至多一个有效预订。提交号在同一审查内唯一：同号同内容重试返回原预订**当前状态**（幂等），同号改内容报冲突；按预订 ID 取消后记录保留、占用立即释放（重复取消返回已取消状态），重新预订须用新提交号。
 
+已生效的预订还可**改期（adjust）**：提交原预订 ID、新泊位、带时区的起止时刻与调整号。**仅在原预订仍有效时受理**；受理时**释放旧窗口与占用新窗口在同一事务内原子完成**——旧记录保留为已取消并以 `replacedByBookingId` 关联新记录，新记录继承原审查、卸港及冻结的清单修订号与实际卸箱数。无效时刻、已取消原预订、调整号冲突或新窗口被占用时**不改变原预订**；新窗口沿用同审查同港唯一、同港同泊位跨航次不重叠与半开区间首尾相接可用的规则。调整号在同一原预订内唯一：同号同内容重试返回**新记录当前状态**（幂等），同号改内容报冲突；起止时刻按绝对时刻比较。
+
 ---
 
 ## 1. 模型与规则
@@ -162,6 +164,7 @@ npm run build && node test/e2e-plans.js       # 试排方案/发布冲突/只读
 npm run build && node test/e2e-migrate.js    # 方案迁移/三方合并/冲突/复验失败/过期/并发
 npm run build && node test/e2e-discharge.js  # 港序卸货审查/逐港模拟/阻挡链/逾港/冻结不变/拒绝/幂等
 npm run build && node test/e2e-berth.js     # 靠泊预订/窗口互斥/跨航次/并发一方成功/幂等/取消释放/冻结不回写
+npm run build && node test/e2e-adjust.js    # 靠泊改期/原子换窗/继承冻结快照/调整号幂等冲突/失败不改原预订/链式/并发
 ```
 
 ---
@@ -201,6 +204,7 @@ npm run build && node test/e2e-berth.js     # 靠泊预订/窗口互斥/跨航�
 | `GET` | `/api/voyages/:id/berth-bookings` | 按航次查询预订与状态 |
 | `GET` | `/api/berth-bookings/:bookingId` | 取单条靠泊预订 |
 | `POST` | `/api/berth-bookings/:bookingId/cancel` | **取消预订**（保留记录、释放占用；重复取消幂等） |
+| `POST` | `/api/berth-bookings/:bookingId/adjust` | **改期预订**（新泊位+带时区窗口+调整号；原子换窗，旧记录关联新记录） |
 | `GET` | `/health` | 健康检查（含数据库连通性） |
 
 ### 4.1 登记航次
@@ -675,7 +679,7 @@ curl -sS -X POST http://localhost:3000/api/discharge-reviews/<reviewId>/berth-bo
 
 - **同港同泊位的有效窗口不得重叠**：以半开区间 `[startAt, endAt)` 判定，故一个窗口的 `end` 恰好等于下一窗口的 `start`（**首尾相接**）允许，只要有任何瞬间重叠即冲突。该互斥是**全局**的——即使两个窗口来自**不同航次的不同审查**，只要卸港名与泊位名相同就互斥；冲突 → 409 `berth_window_overlap`，`details.conflicting` 回带占窗方预订。并发竞争时由部分 GiST 排他约束决出**唯一胜者**，其余事务收到 409；
 - 不同泊位即使完全同时段也互不影响；
-- **同一审查同一卸港至多一个有效预订** → 否则 409 `booking_exists_for_port`（`details.existingBooking` 回带既有预订）；要改期请先取消再用**新提交号**预订。
+- **同一审查同一卸港至多一个有效预订** → 否则 409 `booking_exists_for_port`（`details.existingBooking` 回带既有预订）；要改期可用 `POST /api/berth-bookings/:bookingId/adjust`（见 4.12），或先取消再用**新提交号**重新预订。
 
 **提交号幂等 / 冲突**：
 
@@ -708,14 +712,97 @@ curl -sS -X POST http://localhost:3000/api/discharge-reviews/<reviewId>/berth-bo
 | 409 | `booking_submission_conflict` | 提交号已用于不同内容 / 被并发抢先占用 |
 | 422 | `port_not_dischargeable` | 该港无实际卸箱或存在受阻箱，不满足靠泊受理条件 |
 
+### 4.12 靠泊预订改期（调整已生效的预订，原子换窗）
+
+已生效（`booked`）的靠泊预订可由港口调度员**改期**：换泊位、换窗口或两者一起。改期不修改原记录，而是**在同一事务内**取消旧记录并创建继承其上下文的新记录——**释放旧窗口与占用新窗口原子完成**，任何一步失败都整体回滚，原预订保持不变。
+
+**提交**（路径 `:bookingId` 为仍有效的原预订；请求体给出新泊位、新窗口与调整号）：
+
+```bash
+curl -sS -X POST http://localhost:3000/api/berth-bookings/<bookingId>/adjust \
+  -H 'content-type: application/json' -d '{
+  "berth": "B-8",
+  "startAt": "2026-10-10T13:00:00+08:00",
+  "endAt":   "2026-10-10T16:00:00+08:00",
+  "adjustmentNo": "ADJ-001"
+}'
+```
+
+字段要求：
+
+- `berth`：新泊位标识（非空文本，最长 64）；
+- `startAt` / `endAt`：**带时区**的 ISO 8601 时刻，起点必须严格早于终点（否则 400 `invalid_time_window`，与预订同一套 `unparsable_time` / `start_not_before_end` 判定）；
+- `adjustmentNo`：客户端生成的调整号，**同一原预订内唯一**，是改期重试的幂等键（不同原预订之间互不影响，可各自使用同名调整号）；
+- 审查、卸港与冻结的清单修订号/实际卸箱数**继承自原预订**，不在请求体内（改期不重新判定卸港受理条件，快照随新记录继续冻结、不回写）。
+
+**响应**（首次受理 201；`booking` 为新记录，`previousBooking` 为已取消并关联新记录的原记录）：
+
+```json
+{
+  "adjusted": true,
+  "replay": false,
+  "booking": {
+    "bookingId": "…新 uuid…",
+    "reviewId": "…", "voyageId": "…",
+    "dischargePort": "SIN", "berth": "B-8",
+    "startAt": "2026-10-10T05:00:00.000Z",
+    "endAt":   "2026-10-10T08:00:00.000Z",
+    "submissionNo": null,
+    "adjustmentOfBookingId": "…原预订…",
+    "adjustmentNo": "ADJ-001",
+    "replacedByBookingId": null,
+    "status": "booked", "open": true,
+    "frozenManifestRevision": 1,
+    "dischargedBoxCount": 2,
+    "createdAt": "…", "cancelledAt": null
+  },
+  "previousBooking": {
+    "bookingId": "…原预订…", "berth": "B-7",
+    "status": "cancelled", "open": false,
+    "replacedByBookingId": "…新 uuid…",
+    "cancelledAt": "…"
+  }
+}
+```
+
+**受理与拒绝**（以下任一不满足即拒绝且**原预订保持不变**）：
+
+- 原预订必须存在（未知 → 404 `berth_booking_not_found`）且**仍有效**：已取消（含被先前改期取代）→ 409 `booking_not_active`（`details` 给出当前状态与 `replacedByBookingId`）；
+- 新起止时刻必须合法（否则 400 `invalid_time_window`）；
+- 新窗口沿用同一套互斥规则：**同港同泊位的其他有效窗口不得重叠**（半开区间，首尾相接可用，跨航次同样互斥）→ 409 `berth_window_overlap`（`details.conflicting` 回带占窗方）。原预订自身不参与判定——它在同事务内被先行取消，因此**同泊位平移（新窗口与自身旧窗口重叠）允许**；
+- **同审查同港唯一**同样沿用：新记录继承原审查与卸港，旧记录取消后名额即刻让位于新记录。
+
+**调整号幂等 / 冲突**：
+
+- 相同 `adjustmentNo` + **相同内容**（泊位/起止，时刻按**绝对瞬间**比较——不同时区写法指向同一时刻即相同）重试 → **200 `replay:true`**，返回**新记录当前状态**（新记录此后可能已被取消或再次改期，如实返回），不产生新记录；
+- 相同 `adjustmentNo` + **不同内容** → 409 `booking_adjustment_conflict`（`details.stored` 为已受理的新记录）；再次改期须换用新调整号。
+
+**链式改期与兼容行为**：
+
+- 改期产生的新记录本身也是有效预订，可再次改期（调整号按其自身隔离）或按既有接口取消（取消后其窗口立即释放）；
+- 改期记录的 `submissionNo` 为 `null`：**原提交号永远指向原记录**——用原提交号同内容重试创建接口仍返回原预订的当前状态（已取消、含 `replacedByBookingId`），既有预订/取消/查询/提交号重试行为完全不变；
+- 查询接口（按审查/按航次/单条）返回全部记录（含已取消的改期链），每条带 `adjustmentOfBookingId` / `adjustmentNo` / `replacedByBookingId` 关联字段；
+- 并发：同一原预订的并发改期按行锁串行化，只有一方成功（其余 409 `booking_not_active` 或按调整号幂等回放）；不同原预订竞争同一新窗口时由排他约束决出唯一胜者（败方 409 `berth_window_overlap`，其原预订不变）。
+
+**错误码一览（本节新增）**：
+
+| 状态 | 错误码 | 场景 |
+| --- | --- | --- |
+| 400 | `invalid_request_body` | 请求体缺字段/类型不符（zod 校验） |
+| 400 | `invalid_berth_booking_id` / `invalid_time_window` | 路径 ID 非 UUID；时刻无法解析/缺时区或起点不早于终点 |
+| 404 | `berth_booking_not_found` | 未知原预订 |
+| 409 | `booking_not_active` | 原预订已取消（含已被先前改期取代），仅有效预订可改期 |
+| 409 | `booking_adjustment_conflict` | 调整号已用于该原预订的不同改期内容 |
+| 409 | `berth_window_overlap` | 新窗口与同港同泊位其他有效窗口重叠（含并发竞争失败方） |
+
 ### 状态码约定
 
 | 状态 | 场景 |
 | --- | --- |
 | 200 / 201 | 查询成功 / 创建或首次签发、首次受理上报、首次结案成功、首次发布方案（幂等重试返回 200） |
-| 400 | 请求体非法、未知箱、坐标越界、靠泊预订的非法/缺时区时刻（`invalid_time_window`：`unparsable_time`/`start_not_before_end`）、同港同泊位冲突的请求级前置校验；同批重复箱号；约束变更的非正承重/越界列坐标/重复类别对或重复列覆盖；方案 ID 格式非法；**卸货审查的空/重复港序（`invalid_discharge_request`，issues：`empty_port_order`/`duplicate_port_in_order`/`duplicate_box_in_request`/`unknown_box_for_manifest`/`manifest_box_missing`/`unknown_discharge_port`）；靠泊预订审查外卸港（`unknown_discharge_port_for_review`）** |
+| 400 | 请求体非法、未知箱、坐标越界、靠泊预订的非法/缺时区时刻（`invalid_time_window`：`unparsable_time`/`start_not_before_end`，预订与改期共用）、同港同泊位冲突的请求级前置校验；同批重复箱号；约束变更的非正承重/越界列坐标/重复类别对或重复列覆盖；方案 ID 格式非法；**卸货审查的空/重复港序（`invalid_discharge_request`，issues：`empty_port_order`/`duplicate_port_in_order`/`duplicate_box_in_request`/`unknown_box_for_manifest`/`manifest_box_missing`/`unknown_discharge_port`）；靠泊预订审查外卸港（`unknown_discharge_port_for_review`）** |
 | 404 | 航次/修订号/清单/核对作业/试排方案/**卸货审查/靠泊预订**不存在（含以未签发清单开工或审查） |
-| 409 | 修订号过期（整批调整、约束变更、签发、方案内调整、**方案迁移（分方案/航次两个 scope）**共用）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案；方案已发布（`plan_published`）、航次修订号偏离方案来源（`publish_conflict`）、**方案迁移双方改动目标不同（`migration_conflict`）或无需迁移（`migration_not_needed`）；靠泊窗口重叠（`berth_window_overlap`，含跨航次与并发竞争）、同审查同卸港重复有效预订（`booking_exists_for_port`）、提交号内容冲突（`booking_submission_conflict`）** |
+| 409 | 修订号过期（整批调整、约束变更、签发、方案内调整、**方案迁移（分方案/航次两个 scope）**共用）；同清单重复开工、上报号内容冲突、结案后新上报、核对有差异不可结案；方案已发布（`plan_published`）、航次修订号偏离方案来源（`publish_conflict`）、**方案迁移双方改动目标不同（`migration_conflict`）或无需迁移（`migration_not_needed`）；靠泊窗口重叠（`berth_window_overlap`，含跨航次与并发竞争）、同审查同卸港重复有效预订（`booking_exists_for_port`）、提交号内容冲突（`booking_submission_conflict`）；改期时原预订已失效（`booking_not_active`）、调整号内容冲突（`booking_adjustment_conflict`）** |
 | 422 | 配载规则违反整批拒绝（整批调整、约束变更复验、方案内调整、**方案迁移按当前航次约束复验**）；或尚有箱未配位即签发；**靠泊预订的卸港无实际卸箱或有受阻箱（`port_not_dischargeable`）** |
 | 503 | `/health` 数据库不可达 |
 
@@ -765,6 +852,12 @@ curl -sS -X POST http://localhost:3000/api/discharge-reviews/<reviewId>/berth-bo
   BASE=http://localhost:3000 bash examples/berth-curl.sh
   ```
 
+- `examples/adjust-curl.sh` —— 靠泊预订改期全流程 curl（自备有效预订→无效时刻 400 原预订不变→首次改期 201 原子换窗/继承冻结快照/旧记录关联新记录→同调整号同内容重放/改内容冲突→已取代原预订 409→链式改期→原提交号重试兼容→改期链查询）：
+
+  ```bash
+  BASE=http://localhost:3000 bash examples/adjust-curl.sh
+  ```
+
 - `examples/api.http` —— REST Client / JetBrains HTTP Client 文件（含核对段落）；
 - `examples/demo.ts` —— Node 示例（内置 fetch）：
 
@@ -781,11 +874,11 @@ src/
   domain.ts        领域模型 + 纯函数规则校验（最终布局五项规则、请求级检查、十进制重量、迁移三方合并）
   check.ts         装船核对纯函数（最后上报汇总、应装/已核对/缺失/错位/清单外、结案条件）
   discharge.ts     港序卸货模拟纯函数（请求级校验、逐港列顶卸货迭代、阻挡链关系、逾港未卸、可行性）
-  berthing.ts      靠泊预订纯函数（带时区窗口解析/起点早于终点、卸港受理判定=有实卸且无受阻、提交内容一致性）
+  berthing.ts      靠泊预订纯函数（带时区窗口解析/起点早于终点、卸港受理判定=有实卸且无受阻、提交/改期内容一致性）
   service.ts       事务编排：乐观修订号、整批调整、签发冻结、并发互斥
   check-service.ts 核对作业事务：开工/上报幂等与冲突/留痕/状态/结案冻结（行级互斥）
   discharge-service.ts 卸货审查事务：清单冻结箱位读取、请求校验、模拟落档、同内容幂等（永久留档）
-  berth-service.ts 靠泊预订事务：审查冻结结果读取、受理判定、提交号幂等/冲突、窗口排他与同港唯一（DB 约束兜底并发）、取消释放
+  berth-service.ts 靠泊预订事务：审查冻结结果读取、受理判定、提交号幂等/冲突、窗口排他与同港唯一（DB 约束兜底并发）、取消释放；改期=原子换窗（旧记录取消并关联新记录、新记录继承冻结快照、调整号幂等/冲突）
   plan-service.ts  试排方案事务：建立快照/方案内整批调整/查询/发布/迁移rebase（方案行 + 航次行互斥）
   db.ts            连接池、等待就绪、幂等建表
   schema.sql       PostgreSQL 表结构（航次/列限/箱/不相容规则/修订布局/清单/核对作业与上报/试排方案/卸货审查/靠泊预订）
@@ -796,7 +889,7 @@ test/
   check.test.ts      核对纯函数单元测试
   merge.test.ts      方案迁移三方合并纯函数单元测试（一方改动/双方同位/撤位/冲突）
   discharge.test.ts  港序卸货模拟纯函数单元测试（列顶迭代/连锁卸/阻挡 same/later/earlier/逾港/请求拒绝）
-  berthing.test.ts   靠泊预订纯函数单元测试（带时区窗口/起点早于终点、等效时区、卸港受理判定、提交内容一致性）
+  berthing.test.ts   靠泊预订纯函数单元测试（带时区窗口/起点早于终点、等效时区、卸港受理判定、提交/改期内容一致性）
   e2e.js             对真实 PostgreSQL 的端到端/并发验证（开发辅助）
   e2e-check.js       核对作业端到端/并发验证（开发辅助）
   e2e-constraints.js 安全约束变更端到端/历史留痕/并发验证（开发辅助）
@@ -804,6 +897,7 @@ test/
   e2e-migrate.js     方案迁移端到端/三方合并/冲突/复验失败/过期/连续迁移/并发（开发辅助）
   e2e-discharge.js   港序卸货审查端到端/逐港模拟/阻挡链/逾港/冻结不变/拒绝/幂等（开发辅助）
   e2e-berth.js       靠泊预订端到端/窗口互斥/首尾相接/跨航次/并发一方成功/幂等冲突/取消释放/冻结不回写（开发辅助）
+  e2e-adjust.js      靠泊改期端到端/原子换窗/继承冻结快照/调整号幂等冲突/失败不改原预订/自我平移/链式/并发（开发辅助）
 examples/          curl / .http / Node 调用示例
 Dockerfile  docker-compose.yml
 ```
@@ -822,5 +916,6 @@ Dockerfile  docker-compose.yml
 - `plan_constraint_defaults` / `plan_constraint_column_limits` / `plan_constraint_incompat_rules` 保存方案创建时固定的约束快照（每方案一份，不随方案修订号演进）；发布时把方案布局与这套约束原子复制为航次新修订号的 `placements` 与约束快照。
 - `discharge_reviews` 保存港序卸货审查：`(voyage_id, manifest_rev, request_hash)` 唯一使“同清单 + 同提交内容”天然幂等；`request_jsonb` 冻结有序港序与每箱卸港，`result_jsonb` 冻结逐港模拟结果（各港实卸/受阻/阻挡箱与箱位/逾港未卸/可行性）。审查只读取 `manifest_items` 冻结箱位，**航次后续调整或签发新清单不改变旧审查结论**；同一清单的不同港序/卸港申报各自独立留档。
 - `berth_bookings` 保存靠泊窗口预订：`(review_id, submission_no)` 唯一保证提交号在审查内唯一（支撑同号同内容幂等）；**部分唯一索引** `(review_id, discharge_port) WHERE status='booked'` 保证同一审查同一卸港至多一个有效预订；**部分 GiST 排他约束** `EXCLUDE (discharge_port WITH =, berth WITH =, tstzrange(start_at,end_at,'[)') WITH &&) WHERE status='booked'` 保证同港同泊位有效窗口不重叠（半开区间故首尾相接可用），该约束不区分审查/航次，故**跨航次同名港+同名泊位同样互斥，并发 INSERT 只成功一方**（依赖 `btree_gist` 扩展为文本列提供 GiST `=` 操作类）。取消只把 `status` 置 `cancelled` 并记 `cancelled_at`：记录保留，且因两个部分约束只含 `booked`，占用立即释放。`manifest_rev` 与 `port_box_count` 在受理时从审查冻结结果复制快照，**后续审查调整或签发新清单不回写**；时刻以 `TIMESTAMPTZ` 存储，对外统一 UTC ISO 8601。
+- **改期**在同一事务内完成“旧记录置 `cancelled` + 插入新记录 + 旧记录回写 `replaced_by_id`”：新记录继承原 `review_id`/`voyage_id`/`discharge_port`/`manifest_rev`/`port_box_count`（冻结快照延续），`submission_no` 置空（原提交号永远指向原记录，其重试行为不变），并以 `adjustment_of_id` 指回原预订、`adjustment_no` 记录调整号；**部分唯一索引** `(adjustment_of_id, adjustment_no) WHERE adjustment_no IS NOT NULL` 保证同一原预订的调整号唯一（支撑同号同内容幂等）。新记录同样受上述两个 `booked` 部分约束把关，故同审查同港唯一与跨航次窗口互斥对改期窗口同样生效；同一原预订的并发改期由原预订行锁串行化。以上对既有库通过幂等 `ALTER TABLE ... IF NOT EXISTS` / `DROP NOT NULL` 就地升级。
 
 > 从早期“约束不随修订号留痕”的版本升级时，`src/schema.sql` 启动会幂等地把旧的 `column_weight_limits` / `incompat_rules`（当时全局且不可变）回填为每个历史修订号的快照，再删除旧表；新库不受影响。

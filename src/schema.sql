@@ -312,3 +312,21 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_berth_bookings_review ON berth_bookings (review_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_berth_bookings_voyage ON berth_bookings (voyage_id, created_at);
+
+-- ---- 靠泊预订改期（booking adjustment）----
+-- 港口调度员可调整【仍有效】的靠泊预订：提交原预订 ID、新泊位、带时区起止时刻与调整号。
+-- 同一事务内：旧记录置 cancelled 并以 replaced_by_id 关联新记录（释放旧窗口），
+-- 新记录继承原审查/航次/卸港及冻结的清单修订号与实际卸箱数（占用新窗口），原子完成。
+-- 改期产生的新记录 submission_no 置空（原提交号永远指向原记录，原提交号重试行为不变），
+-- 以 (adjustment_of_id, adjustment_no) 为幂等键：同一原预订的调整号唯一，
+-- 同号同内容重试返回新记录当前状态，同号改内容报冲突。
+-- 以下均为幂等迁移：新库直接生效，旧库启动时就地升级。
+ALTER TABLE berth_bookings ADD COLUMN IF NOT EXISTS adjustment_no TEXT;
+ALTER TABLE berth_bookings ADD COLUMN IF NOT EXISTS adjustment_of_id UUID REFERENCES berth_bookings(id);
+ALTER TABLE berth_bookings ADD COLUMN IF NOT EXISTS replaced_by_id UUID REFERENCES berth_bookings(id);
+ALTER TABLE berth_bookings ALTER COLUMN submission_no DROP NOT NULL;
+
+-- 同一原预订的调整号唯一（部分唯一索引；原始预订 adjustment_no 为 NULL 不参与）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_berth_booking_adjustment
+    ON berth_bookings (adjustment_of_id, adjustment_no)
+    WHERE adjustment_no IS NOT NULL;

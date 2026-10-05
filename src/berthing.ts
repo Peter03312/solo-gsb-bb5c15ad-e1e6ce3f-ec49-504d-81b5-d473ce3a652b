@@ -5,7 +5,8 @@
  *  - 提交带时区的起止时刻（ISO 8601，必须含时区偏移或 Z），起点必须严格早于终点；
  *  - 仅当审查中该卸港【确有实际卸箱且无受阻箱】时才受理（受阻箱是“该港卸不下来的箱”，
  *    有受阻说明该港无法完成卸货，不受理）；
- *  - 提交内容（港/泊位/起止/提交号）的一致性比较用于“同号同内容重试”幂等。
+ *  - 提交内容（港/泊位/起止/提交号）的一致性比较用于“同号同内容重试”幂等；
+ *  - 改期内容（新泊位/起止/调整号）的一致性比较用于“同调整号同内容重试”幂等。
  *
  * 具体的留档读取、冻结与并发互斥由 berth-service 编排。
  */
@@ -137,4 +138,29 @@ export function sameBookingContent(a: BerthBookingContent, b: BerthBookingConten
     a.startMs === b.startMs &&
     a.endMs === b.endMs
   );
+}
+
+/* ---------- 改期内容一致性（同调整号重试幂等） ---------- */
+
+/**
+ * 一次靠泊预订改期的业务内容（调整号是幂等键，不参与内容比较）。
+ * 审查/卸港/冻结快照继承自原预订，不属于改期内容。
+ */
+export interface BerthAdjustmentContent {
+  berth: string;
+  /** 绝对起始时刻（毫秒） */
+  startMs: number;
+  /** 绝对结束时刻（毫秒） */
+  endMs: number;
+}
+
+/**
+ * 判断同调整号的重试是否与首次受理内容一致。
+ * 时刻按【绝对瞬间】比较（不同时区写法指向同一时刻即相同），泊位按精确文本比较。
+ */
+export function sameAdjustmentContent(
+  a: BerthAdjustmentContent,
+  b: BerthAdjustmentContent,
+): boolean {
+  return a.berth === b.berth && a.startMs === b.startMs && a.endMs === b.endMs;
 }
